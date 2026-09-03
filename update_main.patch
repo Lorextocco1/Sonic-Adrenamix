@@ -1,0 +1,12 @@
+--- app/src/main/java/com/example/MainActivity.kt
++++ app/src/main/java/com/example/MainActivity.kt
+@@ -91,6 +91,8 @@
+ 
+ class MainActivity : ComponentActivity() {
+   override fun onCreate(savedInstanceState: Bundle?) {
++    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
++      requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
++    }
+     super.onCreate(savedInstanceState)
+     AppLogger.log("MainActivity onCreate - App Started")
+     try {

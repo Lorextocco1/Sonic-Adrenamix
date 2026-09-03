@@ -1,0 +1,10 @@
+--- app/src/main/java/com/example/ui/player/LocalPlayerViewModel.kt
++++ app/src/main/java/com/example/ui/player/LocalPlayerViewModel.kt
+@@ -148,6 +148,7 @@
+         }
+         controller.setMediaItems(mediaItems, startIndex, 0)
+         controller.prepare()
++        controller.repeatMode = Player.REPEAT_MODE_ALL
+         controller.play()
+         _currentTrackIndex.value = startIndex
+     }
