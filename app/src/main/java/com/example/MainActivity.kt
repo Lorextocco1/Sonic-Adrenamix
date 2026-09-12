@@ -204,6 +204,7 @@ fun AppNavigation(modifier: Modifier = Modifier) {
           "Sonic and the Black Knight" -> "https://www.youtube.com/playlist?list=PLvNp0Boas721Xb1rZMrxR_NHEKRpO5VNf"
           "Sonic Colors" -> "https://www.youtube.com/playlist?list=PLvNp0Boas721kdXyVrMyRCaDIRWSSQQgq"
           "Sonic Colors DS" -> "https://www.youtube.com/playlist?list=PLqzVNX9DhzKFywTVKUu72XNEzhB-L4s4Y"
+          "Sonic Colors Ultimate" -> "https://www.youtube.com/playlist?list=PLvNp0Boas720R_z-lr1hiooDly03Q5Z6f"
           "Sonic Unleashed" -> "https://www.youtube.com/playlist?list=PLvNp0Boas723dWdYd0lLxuIOXkf3SCdxO"
           "Sonic Generations" -> "https://www.youtube.com/playlist?list=PL1A538347CCEAFE66"
           "Sonic Generations 3DS" -> "https://www.youtube.com/playlist?list=PL3FCDE9C63F13F2C5"
@@ -450,6 +451,7 @@ val ALL_GAMES = listOf(
     GameMedia("Sonic and the Black Knight", R.drawable.sonic_and_the_black_knight),
     GameMedia("Sonic Colors", R.drawable.sonic_colors),
     GameMedia("Sonic Colors DS", R.drawable.sonic_colors_ds),
+    GameMedia("Sonic Colors Ultimate", R.drawable.sonic_colors_ultimate),
     GameMedia("Sonic Unleashed", R.drawable.sonic_unleashed),
     GameMedia("Sonic Generations", R.drawable.sonic_generations),
     GameMedia("Sonic Generations 3DS", R.drawable.sonic_generations_3ds),
@@ -553,6 +555,7 @@ fun PlayerScreen(navController: NavController? = null, gameName: String, startIn
   val currentIndex by viewModel.currentTrackIndex.collectAsState()
   val isPlaying by viewModel.isPlaying.collectAsState()
   val currentPosition by viewModel.currentPosition.collectAsState()
+  val favorites by com.example.ui.playlist.FavoritesManager.favorites.collectAsState()
 
   LaunchedEffect(gameName) {
     viewModel.loadFolder("music/$gameName", startIndex)
@@ -673,7 +676,7 @@ fun PlayerScreen(navController: NavController? = null, gameName: String, startIn
           
           Spacer(modifier = Modifier.height(16.dp))
 
-          val isFav = com.example.ui.playlist.FavoritesManager.isFavorite(currentTrack.url)
+          val isFav = favorites.any { it.url == currentTrack.url }
 
           IconButton(onClick = {
 

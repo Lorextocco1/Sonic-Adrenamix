@@ -89,8 +89,26 @@ class LocalPlayerViewModel(application: Application) : AndroidViewModel(applicat
             val loadedTracks = if (folderPath == "music/Favorites") {
                 FavoritesManager.favorites.value.mapIndexedNotNull { i, fav ->
                     val rootMusicDir = File(getApplication<Application>().filesDir, "music/${fav.gameName}")
-                    val audioFile = File(rootMusicDir, fav.audioFile)
-                    if (audioFile.exists()) {
+                    var audioFile = File(rootMusicDir, fav.audioFile)
+                    
+                    if (!audioFile.exists() || fav.audioFile.isEmpty()) {
+                        val jsonFiles = rootMusicDir.listFiles { f -> f.name.endsWith(".json") }
+                        val matchingJson = jsonFiles?.find { f -> 
+                            try {
+                                val j = JSONObject(f.readText())
+                                j.optString("url", "") == fav.url || j.optString("title", "") == fav.title
+                            } catch(e: Exception) { false }
+                        }
+                        if (matchingJson != null) {
+                            val j = JSONObject(matchingJson.readText())
+                            val resolvedAudioFile = j.optString("audioFile", "")
+                            if (resolvedAudioFile.isNotEmpty()) {
+                                audioFile = File(rootMusicDir, resolvedAudioFile)
+                            }
+                        }
+                    }
+                    
+                    if (audioFile.exists() && audioFile.isFile) {
                         TrackInfo(
                             title = fav.title,
                             uploader = fav.uploader,

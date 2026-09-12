@@ -1,6 +1,9 @@
 package com.example.ui.playlist
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import android.app.Notification
+import java.util.concurrent.ConcurrentHashMap
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -10,23 +13,27 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import com.example.R
 import com.example.MainActivity
+import com.example.R
 import com.example.util.AppLogger
+import java.io.File
+import java.io.FileOutputStream
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.stream.StreamInfoItem
-import java.io.File
-import java.io.FileOutputStream
+
+
 
 class DownloadService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var isDownloading = false
+    private val downloadMutex = kotlinx.coroutines.sync.Mutex()
+    private var activeJobCount = 0
     private val completedTracks = mutableListOf<String>()
-    
+    private val activeDownloads = ConcurrentHashMap<String, Int>()
+
     companion object {
         const val CHANNEL_ID = "download_channel"
         const val NOTIFICATION_ID = 1001
@@ -39,22 +46,25 @@ class DownloadService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val gameName = intent?.getStringExtra("gameName") ?: return START_NOT_STICKY
-        val url = intent.getStringExtra("url") ?: return START_NOT_STICKY
+        val indices = intent.getIntArrayExtra("indices") ?: return START_NOT_STICKY
 
-        if (!isDownloading) {
-            isDownloading = true
-            startForeground(NOTIFICATION_ID, buildNotification("Preparazione download...", "", gameName))
-            serviceScope.launch {
+        activeJobCount++
+        startForeground(NOTIFICATION_ID, buildNotification("In coda...", "Attesa download precedente", gameName))
+        
+        serviceScope.launch {
+            downloadMutex.withLock {
                 try {
-                    handleDownload(gameName, url)
+                    startForeground(NOTIFICATION_ID, buildNotification("Preparazione download...", "", gameName))
+                    handleDownload(gameName, indices)
                 } finally {
-                    isDownloading = false
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                    activeJobCount--
+                    if (activeJobCount == 0) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
                 }
             }
         }
-
         return START_NOT_STICKY
     }
 
@@ -78,165 +88,140 @@ class DownloadService : Service() {
         completedTracks.takeLast(4).forEach { trackTitle ->
             inboxStyle.addLine("✓ $trackTitle")
         }
-        if (title.isNotEmpty() && progress > 0) {
-            inboxStyle.addLine("↓ $title - $progress%")
+        
+        var totalProgress = 0
+        var activeCount = 0
+        // Limit to prevent notification content from becoming too large
+        activeDownloads.entries.take(3).forEach { (downloadTitle, downloadProgress) ->
+            inboxStyle.addLine("↓ $downloadTitle - $downloadProgress%")
+            totalProgress += downloadProgress
+            activeCount++
         }
+        
+        val averageProgress = if (activeCount > 0) totalProgress / activeCount else progress
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Download - $gameName")
-            .setContentText(if (title.isNotEmpty()) "$title ($progress%)" else text)
+            .setContentText(if (activeCount > 0) "Scaricamento in corso..." else if (title.isNotEmpty()) title else "Attendere...")
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setOngoing(true)
-            .setProgress(100, progress, progress == 0)
+            .setProgress(100, averageProgress, activeCount == 0 && progress == 0)
             .setContentIntent(pendingIntent)
             .setStyle(inboxStyle)
             .build()
     }
 
-    private fun updateNotification(title: String, gameName: String, progress: Int) {
-        val notification = buildNotification(title, "", gameName, progress)
+    private fun updateNotification(gameName: String) {
+        val notification = buildNotification("", "", gameName, 0)
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify(NOTIFICATION_ID, notification)
     }
 
-    private suspend fun handleDownload(gameName: String, rawUrl: String) {
+
+        private suspend fun handleDownload(gameName: String, indices: IntArray) {
         val destFolder = File(filesDir, "music/$gameName")
         if (!destFolder.exists()) destFolder.mkdirs()
 
-        val url = rawUrl.replace("https://youtube.com/", "https://www.youtube.com/")
-            .replace("https://m.youtube.com/", "https://www.youtube.com/")
-            .replace("https://youtu.be/", "https://www.youtube.com/watch?v=")
-
-        val existingJsonMap = readOfflineTracks(destFolder)
-        
         try {
-            DownloadManager.setExtracting(gameName, true)
-            val service = ServiceList.YouTube
-            val extractor = service.getPlaylistExtractor(url)
-            extractor.fetchPage()
-            val allItems = mutableListOf<StreamInfoItem>()
-            allItems.addAll(extractor.initialPage.items)
-            var currentPage = extractor.initialPage
-            while (currentPage.hasNextPage()) {
-                currentPage = extractor.getPage(currentPage.nextPage)
-                allItems.addAll(currentPage.items)
-            }
-
-            val initialTrackStates = allItems.mapIndexed { index, item ->
-                val rawName = item.name ?: "Track ${index + 1}"
-                val cleanTitle = rawName
-                    .replace(Regex("^\\s*\\d+[\\.\\-\\_\\s]+"), "")
-                    .replace(Regex("\\[OST\\]", RegexOption.IGNORE_CASE), "")
-                    .replace(Regex("- Sonic the Hedgehog", RegexOption.IGNORE_CASE), "")
-                    .trim()
-                    .ifEmpty { rawName }
-                val bestThumbnail = item.thumbnails.maxByOrNull { it.height * it.width }?.url
-                    ?: item.thumbnails.firstOrNull()?.url
-                    ?: ""
-                val existing = existingJsonMap[item.url] ?: existingJsonMap[cleanTitle]
-                val isAlreadyDownloaded = existing != null
-                TrackState(
-                    title = cleanTitle,
-                    uploader = item.uploaderName ?: "Sega / DeoxysPrime",
-                    duration = item.duration,
-                    thumbnailUrl = bestThumbnail,
-                    url = item.url,
-                    downloadProgress = if (isAlreadyDownloaded) 1f else 0f,
-                    isDownloading = false,
-                    isCompleted = isAlreadyDownloaded,
-                    index = index
-                )
-            }
+            val tracks = DownloadManager.tracks.value[gameName] ?: return
             
-            DownloadManager.updateTracks(gameName, initialTrackStates)
-            DownloadManager.setExtracting(gameName, false)
-
-            for ((index, item) in allItems.withIndex()) {
-                val tracks = DownloadManager.tracks.value[gameName] ?: continue
+            for (index in indices) {
                 val track = tracks.getOrNull(index) ?: continue
+                
                 if (track.isCompleted) {
                     if (!completedTracks.contains(track.title)) {
                         completedTracks.add(track.title)
                     }
                     continue
                 }
-                downloadTrack(index, item.url, track.title, track.thumbnailUrl, destFolder, gameName)
+                
+                activeDownloads.clear() // since it's sequential
+                activeDownloads[track.title] = 0
+                updateNotification(gameName)
+                downloadTrack(index, track.url, track.title, track.thumbnailUrl, destFolder, gameName)
                 completedTracks.add(track.title)
-                updateNotification("", gameName, 0)
+                activeDownloads.remove(track.title)
+                updateNotification(gameName)
             }
         } catch (e: Exception) {
-            AppLogger.logError("Failed to extract playlist for $gameName", e)
-            DownloadManager.setExtracting(gameName, false)
+            AppLogger.logError("Failed to download tracks for $gameName", e)
         }
     }
 
     private suspend fun downloadTrack(index: Int, url: String, cleanTitle: String, thumbnailUrl: String, destFolder: File, gameName: String) {
-        try {
-            DownloadManager.updateTrack(gameName, index) { it.copy(isDownloading = true, downloadProgress = 0.05f) }
-            updateNotification(cleanTitle, gameName, 5)
-            
-            val service = ServiceList.YouTube
-            val extractor = service.getStreamExtractor(url)
-            extractor.fetchPage()
-            val audioStreams = extractor.audioStreams
-            if (audioStreams.isNotEmpty()) {
-                val bestAudio = audioStreams.filter { it.format?.suffix == "m4a" }.maxByOrNull { it.averageBitrate } ?: audioStreams.maxByOrNull { it.averageBitrate } ?: audioStreams.first()
-                val audioUrl = bestAudio.content
-                val ext = bestAudio.format?.suffix ?: "m4a"
-                val safeTitle = cleanTitle.replace("[^a-zA-Z0-9.-]".toRegex(), "_")
-                val audioFile = File(destFolder, "${String.format("%02d", index + 1)}_$safeTitle.$ext")
-                val highResThumbnail = try {
-                    extractor.thumbnails.maxByOrNull { it.height * it.width }?.url
-                        ?: extractor.thumbnails.firstOrNull()?.url
-                        ?: thumbnailUrl
-                } catch (e: Exception) {
-                    thumbnailUrl
+        val maxRetries = 3
+        for (attempt in 1..maxRetries) {
+            try {
+                DownloadManager.updateTrack(gameName, index) { it.copy(isDownloading = true, downloadProgress = 0.05f) }
+                
+                val service = ServiceList.YouTube
+                val extractor = service.getStreamExtractor(url)
+                extractor.fetchPage()
+                val audioStreams = extractor.audioStreams
+                if (audioStreams.isNotEmpty()) {
+                    val bestAudio = audioStreams.filter { it.format?.suffix == "m4a" }.maxByOrNull { it.averageBitrate } ?: audioStreams.maxByOrNull { it.averageBitrate } ?: audioStreams.first()
+                    val audioUrl = bestAudio.content
+                    val ext = bestAudio.format?.suffix ?: "m4a"
+                    val safeTitle = cleanTitle.replace("[^a-zA-Z0-9.-]".toRegex(), "_")
+                    val audioFile = File(destFolder, "${String.format("%02d", index + 1)}_$safeTitle.$ext")
+                    val highResThumbnail = try {
+                        extractor.thumbnails.maxByOrNull { it.height * it.width }?.url
+                            ?: extractor.thumbnails.firstOrNull()?.url
+                            ?: thumbnailUrl
+                    } catch (e: Exception) {
+                        thumbnailUrl
+                    }
+                    
+                    downloadFileWithProgress(audioUrl, audioFile, index, gameName, cleanTitle)
+                    
+                    val metadataJson = JSONObject().apply {
+                        put("title", cleanTitle)
+                        put("uploader", extractor.uploaderName ?: "Unknown")
+                        put("duration", extractor.length)
+                        put("thumbnailUrl", highResThumbnail)
+                        put("url", url)
+                        put("audioFile", audioFile.name)
+                        put("index", index)
+                    }
+                    val metadataFile = File(destFolder, "${String.format("%02d", index + 1)}_$safeTitle.json")
+                    metadataFile.writeText(metadataJson.toString())
+                    
+                    DownloadManager.updateTrack(gameName, index) {
+                        it.copy(
+                            isDownloading = false,
+                            isCompleted = true,
+                            downloadProgress = 1f,
+                            uploader = extractor.uploaderName ?: it.uploader,
+                            duration = extractor.length,
+                            thumbnailUrl = highResThumbnail,
+                            audioFile = audioFile.name
+                        )
+                    }
                 }
-                
-                downloadFileWithProgress(audioUrl, audioFile, index, gameName, cleanTitle)
-                
-                val metadataJson = JSONObject().apply {
-                    put("title", cleanTitle)
-                    put("uploader", extractor.uploaderName ?: "Unknown")
-                    put("duration", extractor.length)
-                    put("thumbnailUrl", highResThumbnail)
-                    put("url", url)
-                    put("audioFile", audioFile.name)
-                    put("index", index)
-                }
-                val metadataFile = File(destFolder, "${String.format("%02d", index + 1)}_$safeTitle.json")
-                metadataFile.writeText(metadataJson.toString())
-                
-                DownloadManager.updateTrack(gameName, index) {
-                    it.copy(
-                        isDownloading = false,
-                        isCompleted = true,
-                        downloadProgress = 1f,
-                        uploader = extractor.uploaderName ?: it.uploader,
-                        duration = extractor.length,
-                        thumbnailUrl = highResThumbnail,
-                        audioFile = audioFile.name
-                    )
+                break
+            } catch (e: Exception) {
+                AppLogger.logError("Failed to download track $url, attempt $attempt", e)
+                if (attempt == maxRetries) {
+                    DownloadManager.updateTrack(gameName, index) { it.copy(isDownloading = false, isCompleted = false) }
+                } else {
+                    delay(1000)
                 }
             }
-        } catch (e: Exception) {
-            AppLogger.logError("Failed to download track $url", e)
-            DownloadManager.updateTrack(gameName, index) { it.copy(isDownloading = false, isCompleted = false) }
         }
     }
 
     private suspend fun downloadFileWithProgress(url: String, file: File, trackIndex: Int, gameName: String, cleanTitle: String) {
         withContext(Dispatchers.IO) {
-            val client = OkHttpClient()
+            val client = OkHttpClient.Builder().connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS).readTimeout(60, java.util.concurrent.TimeUnit.SECONDS).build()
             val request = Request.Builder().url(url).build()
             client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return@use
-                val body = response.body ?: return@use
+                if (!response.isSuccessful) throw java.io.IOException("Unexpected code $response")
+                val body = response.body ?: throw java.io.IOException("Empty body")
                 val totalBytes = body.contentLength()
                 val fos = FileOutputStream(file)
                 fos.use { out ->
                     body.byteStream().use { input ->
-                        val buffer = ByteArray(8192)
+                        val buffer = ByteArray(1024 * 1024)
                         var bytesRead: Int
                         var downloadedBytes = 0L
                         var lastReportTime = 0L
@@ -248,7 +233,12 @@ class DownloadService : Service() {
                                 lastReportTime = currentTime
                                 val progress = if (totalBytes > 0) downloadedBytes.toFloat() / totalBytes else 0.5f
                                 DownloadManager.updateTrack(gameName, trackIndex) { it.copy(downloadProgress = progress) }
-                                updateNotification(cleanTitle, gameName, (progress * 100).toInt())
+                                
+                                val progressInt = (progress * 100).toInt()
+                                if (activeDownloads[cleanTitle] != progressInt) {
+                                    activeDownloads[cleanTitle] = progressInt
+                                    updateNotification(gameName)
+                                }
                             }
                         }
                     }

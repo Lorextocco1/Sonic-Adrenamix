@@ -1,53 +1,76 @@
-package com.example.ui.playlist
+with open('app/src/main/java/com/example/ui/playlist/GamePlaylistViewModel.kt', 'r') as f:
+    content = f.read()
 
-import android.app.Application
-import android.content.Intent
-import androidx.core.content.ContextCompat
-import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.viewModelScope
-import com.example.util.AppLogger
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.stateIn
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import org.schabi.newpipe.extractor.ServiceList
+imports = """import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.stream.StreamInfoItem
-import java.io.File
+import java.io.File"""
 
-data class TrackState(
-    val title: String,
-    val uploader: String,
-    val duration: Long,
-    val thumbnailUrl: String,
-    val url: String,
-    val downloadProgress: Float, // 0 to 1
-    val isDownloading: Boolean,
-    val isCompleted: Boolean,
-    val audioFile: String = "",
-    val index: Int = 0
-)
+content = content.replace("import java.io.File", imports)
 
-class GamePlaylistViewModel(application: Application) : AndroidViewModel(application) {
-    private val currentGameName = MutableStateFlow("")
+target = """    fun loadOrDownload(gameName: String, rawUrl: String) {
+        currentGameName.value = gameName
+        val destFolder = File(getApplication<Application>().filesDir, "music/$gameName")
+        if (!destFolder.exists()) destFolder.mkdirs()
 
-    val tracks: StateFlow<List<TrackState>> = combine(DownloadManager.tracks, currentGameName) { map, game ->
-        map[game] ?: emptyList()
-    }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+        viewModelScope.launch(Dispatchers.IO) {
+            val localFiles = destFolder.listFiles { f -> f.name.endsWith(".json") }
+            val existingJsonMap = mutableMapOf<String, JSONObject>()
+            localFiles?.forEach { file ->
+                try {
+                    val json = JSONObject(file.readText())
+                    val audioFileName = json.optString("audioFile", "")
+                    if (File(destFolder, audioFileName).exists()) {
+                        existingJsonMap[json.optString("url", "")] = json
+                        existingJsonMap[json.optString("title", "")] = json
+                    }
+                } catch (e: Exception) {
+                    AppLogger.logError("Error reading local json: ${file.name}", e)
+                }
+            }
 
-    val isExtractingInfo: StateFlow<Boolean> = combine(DownloadManager.isExtracting, currentGameName) { map, game ->
-        map[game] ?: false
-    }.stateIn(viewModelScope, SharingStarted.Lazily, false)
+            val offlineTracks = existingJsonMap.values.map { json ->
+                TrackState(
+                    title = json.optString("title", "Unknown"),
+                    uploader = json.optString("uploader", "Unknown"),
+                    duration = json.optLong("duration", 0L),
+                    thumbnailUrl = json.optString("thumbnailUrl", ""),
+                    url = json.optString("url", ""),
+                    downloadProgress = 1f,
+                    isDownloading = false,
+                    isCompleted = true,
+                    audioFile = json.optString("audioFile", ""),
+                    index = json.optInt("index", 0)
+                )
+            }.sortedBy { it.index }.distinctBy { it.url }
 
-    private val _errorMessage = MutableStateFlow<String?>(null)
-    val errorMessage: StateFlow<String?> = _errorMessage
+            // Only update if we don't already have tracks from DownloadManager
+            if (DownloadManager.tracks.value[gameName].isNullOrEmpty()) {
+                withContext(Dispatchers.Main) {
+                    DownloadManager.updateTracks(gameName, offlineTracks)
+                }
+            }
 
-    fun loadOrExtract(gameName: String, rawUrl: String) {
-        _errorMessage.value = null
+            if (rawUrl.isEmpty()) return@launch
+
+            val currentTracks = DownloadManager.tracks.value[gameName]
+            val isAlreadyExtracting = DownloadManager.isExtracting.value[gameName] == true
+            
+            if (!currentTracks.isNullOrEmpty() || isAlreadyExtracting) {
+                // If we already have tracks in memory or it's currently extracting/queued, skip starting the service again
+                return@launch
+            }
+
+            DownloadManager.setExtracting(gameName, true)
+
+            val intent = Intent(getApplication(), DownloadService::class.java).apply {
+                putExtra("gameName", gameName)
+                putExtra("url", rawUrl)
+            }
+            ContextCompat.startForegroundService(getApplication(), intent)
+        }
+    }"""
+
+replacement = """    fun loadOrExtract(gameName: String, rawUrl: String) {
         currentGameName.value = gameName
         val destFolder = File(getApplication<Application>().filesDir, "music/$gameName")
         if (!destFolder.exists()) destFolder.mkdirs()
@@ -120,8 +143,8 @@ class GamePlaylistViewModel(application: Application) : AndroidViewModel(applica
                 val initialTrackStates = allItems.mapIndexed { index, item ->
                     val rawName = item.name ?: "Track ${index + 1}"
                     val cleanTitle = rawName
-                        .replace(Regex("^\\s*\\d+[\\.\\-\\_\\s]+"), "")
-                        .replace(Regex("\\[OST\\]", RegexOption.IGNORE_CASE), "")
+                        .replace(Regex("^\\\\s*\\\\d+[\\\\.\\\\-\\\\_\\\\s]+"), "")
+                        .replace(Regex("\\\\[OST\\\\]", RegexOption.IGNORE_CASE), "")
                         .replace(Regex("- Sonic the Hedgehog", RegexOption.IGNORE_CASE), "")
                         .trim()
                         .ifEmpty { rawName }
@@ -152,7 +175,6 @@ class GamePlaylistViewModel(application: Application) : AndroidViewModel(applica
                 }
             } catch (e: Exception) {
                 AppLogger.logError("Failed to extract playlist for $gameName", e)
-                _errorMessage.value = "Errore: ${e.message}"
             } finally {
                 DownloadManager.setExtracting(gameName, false)
             }
@@ -165,5 +187,8 @@ class GamePlaylistViewModel(application: Application) : AndroidViewModel(applica
             putExtra("indices", indices)
         }
         ContextCompat.startForegroundService(getApplication(), intent)
-    }
-}
+    }"""
+
+with open('app/src/main/java/com/example/ui/playlist/GamePlaylistViewModel.kt', 'w') as f:
+    f.write(content.replace(target, replacement))
+print("Patched VM")
